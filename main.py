@@ -33,6 +33,7 @@ from app_support.followups import (
     followup_dispatcher_loop,
     release_followup_dispatch_lock,
 )
+from app_support.channels import build_channels_router
 from app_support.dashboard import build_dashboard_router
 from app_support.whatsapp import (
     WhatsAppRuntimeState,
@@ -146,54 +147,7 @@ async def _dispatch_due_followups_once() -> None:
     )
 
 
-# ------------------------------------------------------------------ #
-# Facebook Messenger Webhook
-# ------------------------------------------------------------------ #
-
-@app.get("/webhook/messenger")
-async def fb_verify(request: Request):
-    """Facebook webhook verification challenge."""
-    mode = request.query_params.get("hub.mode")
-    token = request.query_params.get("hub.verify_token")
-    challenge = request.query_params.get("hub.challenge")
-
-    if mode == "subscribe" and token == settings.fb_verify_token:
-        log.info("fb_webhook_verified")
-        return PlainTextResponse(challenge)
-    raise HTTPException(status_code=403, detail="Verification failed")
-
-
 _is_valid_fb_signature = is_valid_fb_signature
-
-
-@app.post("/webhook/messenger")
-async def fb_webhook(request: Request):
-    """Receive and process Facebook Messenger events."""
-    raw_body = await request.body()
-    signature = request.headers.get("X-Hub-Signature-256")
-    if not _is_valid_fb_signature(raw_body, signature):
-        raise HTTPException(status_code=403, detail="Invalid Facebook signature")
-    body = json.loads(raw_body)
-
-    if body.get("object") != "page":
-        return JSONResponse({"status": "ignored"})
-
-    for entry in body.get("entry", []):
-        for event in entry.get("messaging", []):
-            sender_id = event.get("sender", {}).get("id")
-            if not sender_id:
-                continue
-
-            # Only process plain text messages
-            msg = event.get("message", {})
-            if "text" not in msg:
-                continue
-
-            text = msg["text"]
-            # Process asynchronously to return 200 immediately
-            asyncio.create_task(_handle_fb_message(sender_id, text))
-
-    return JSONResponse({"status": "ok"})
 
 
 async def _handle_fb_message(sender_id: str, text: str):
@@ -279,52 +233,6 @@ def _wa_enqueue(sender_id: str, text: str, name: Optional[str]) -> None:
     )
 
 
-@app.post("/webhook/whatsapp")
-async def wa_webhook(request: Request):
-    """Receive inbound WhatsApp events from Evolution API."""
-    body = await request.json()
-
-    event = body.get("event")
-
-    # Only care about new inbound messages
-    if event != "messages.upsert":
-        return JSONResponse({"status": "ignored"})
-
-    data = body.get("data", {})
-
-    # Skip messages sent by us
-    if data.get("key", {}).get("fromMe"):
-        return JSONResponse({"status": "ignored"})
-
-    sender_jid = data.get("key", {}).get("remoteJid", "")   # "60123456789@s.whatsapp.net"
-    sender_id = normalize_whatsapp_id(sender_jid)
-    name       = data.get("pushName")
-
-    # Skip group messages
-    if "@g.us" in sender_jid:
-        return JSONResponse({"status": "group_ignored"})
-
-    # Extract text from different message types
-    msg  = data.get("message", {})
-    text = (
-        msg.get("conversation")
-        or msg.get("extendedTextMessage", {}).get("text")
-        or msg.get("buttonsResponseMessage", {}).get("selectedDisplayText")
-        or msg.get("listResponseMessage", {}).get("title")
-    )
-
-    if not sender_id:
-        return JSONResponse({"status": "ignored"})
-
-    if not text:
-        # Non-text message (image, audio, sticker…)
-        asyncio.create_task(_wa_handle_unsupported(sender_id))
-        return JSONResponse({"status": "ok"})
-
-    _wa_enqueue(sender_id, text, name)
-    return JSONResponse({"status": "ok"})
-
-
 async def _wa_shadow_log_customer(sender_id: str, text: str, name: Optional[str]) -> None:
     await whatsapp_shadow_log_customer(Database, log, sender_id, text, name)
 
@@ -344,18 +252,6 @@ def _format_catchup(shadow_messages: list) -> str:
     return whatsapp_format_catchup(shadow_messages)
 
 
-class AdminReplyMessage(BaseModel):
-    recipient_id: str
-    text: str
-
-
-@app.post("/internal/wa/admin-reply")
-async def wa_admin_reply(msg: AdminReplyMessage, _: None = Depends(_require_admin_access)):
-    """Called by the WA gateway when the admin manually replies to a customer."""
-    asyncio.create_task(_handle_admin_reply(msg.recipient_id, msg.text))
-    return {"status": "ok"}
-
-
 async def _handle_admin_reply(recipient_jid: str, text: str) -> None:
     """Shadow-log admin replies without pausing Maya."""
     try:
@@ -366,26 +262,6 @@ async def _handle_admin_reply(recipient_jid: str, text: str) -> None:
         log.info("admin_reply_shadow_logged", recipient=recipient_jid, preview=text[:60])
     except Exception as exc:
         log.error("handle_admin_reply_error", error=str(exc))
-
-
-class PauseRequest(BaseModel):
-    paused: bool
-    token: str
-
-
-@app.post("/api/wa/pause/{conv_id}")
-async def set_pause_by_conv(conv_id: UUID, body: PauseRequest, _: None = Depends(_require_admin_access)):
-    """Dashboard toggle — called by conversation detail page JS."""
-    if not _verify_pause_action_token(conv_id, body.paused, body.token):
-        raise HTTPException(status_code=403, detail="Invalid pause token")
-    detail = await Database.get_conversation_detail(conv_id)
-    if not detail:
-        raise HTTPException(status_code=404, detail="Conversation not found")
-    user_id = detail["user_id"]
-    external_id = detail["external_id"]
-    _set_paused_memory(external_id, body.paused)
-    await Database.set_user_paused(user_id, body.paused)
-    return {"ok": True, "paused": body.paused}
 
 
 def _is_manager(sender_id: str) -> bool:
@@ -501,42 +377,15 @@ async def _wa_send_text(to: str, text: str):
     )
 
 
-# ------------------------------------------------------------------ #
-# Test / Simulator Chat API
-# ------------------------------------------------------------------ #
-
-class ChatRequest(BaseModel):
-    user_id: str
-    message: str
-    channel: str = "test"
-
-
-@app.post("/api/chat")
-async def chat(req: ChatRequest):
-    """Simulate a conversation without connecting to a real channel."""
-    response_text = await agent.process_message(
-        external_id=req.user_id,
-        message=req.message,
-        channel=req.channel,
+async def _process_test_chat(user_id: str, message: str, channel: str):
+    return await agent.process_message(
+        external_id=user_id,
+        message=message,
+        channel=channel,
     )
-    return {"reply": response_text}
 
 
-class WAInternalMessage(BaseModel):
-    sender_id: str
-    text: str
-    name: Optional[str] = None
-
-
-@app.post("/internal/wa")
-async def wa_internal(msg: WAInternalMessage, _: None = Depends(_require_admin_access)):
-    """Receive inbound WhatsApp messages from the local WA Gateway."""
-    _wa_enqueue(msg.sender_id, msg.text, msg.name)
-    return {"status": "ok"}
-
-
-@app.get("/api/chat/{external_id}/history")
-async def chat_history(external_id: str):
+async def _get_chat_history(external_id: str):
     user = await Database.get_user_by_external_id(external_id)
     if not user:
         return {"messages": []}
@@ -545,3 +394,48 @@ async def chat_history(external_id: str):
         return {"messages": []}
     history = await Database.get_conversation_history(conv["id"], limit=100)
     return {"messages": history}
+
+
+_channels_router, _channel_exports = build_channels_router(
+    settings=settings,
+    require_admin_access=_require_admin_access,
+    verify_pause_action_token=_verify_pause_action_token,
+    is_valid_fb_signature=_is_valid_fb_signature,
+    handle_fb_message=_handle_fb_message,
+    send_fb_reply=_send_fb_reply,
+    wa_enqueue=_wa_enqueue,
+    handle_unsupported=_wa_handle_unsupported,
+    handle_admin_reply=_handle_admin_reply,
+    set_paused_memory=_set_paused_memory,
+    store_outbound_message=_store_outbound_message,
+    process_test_chat=_process_test_chat,
+    get_chat_history=_get_chat_history,
+    db=Database,
+    fallback_reply=_FALLBACK_REPLY,
+)
+app.include_router(_channels_router)
+
+ChatRequest = _channel_exports["ChatRequest"]
+WAInternalMessage = _channel_exports["WAInternalMessage"]
+AdminReplyMessage = _channel_exports["AdminReplyMessage"]
+PauseRequest = _channel_exports["PauseRequest"]
+fb_verify = _channel_exports["fb_verify"]
+fb_webhook = _channel_exports["fb_webhook"]
+wa_webhook = _channel_exports["wa_webhook"]
+wa_admin_reply = _channel_exports["wa_admin_reply"]
+chat = _channel_exports["chat"]
+wa_internal = _channel_exports["wa_internal"]
+chat_history = _channel_exports["chat_history"]
+
+
+async def set_pause_by_conv(conv_id: UUID, body: PauseRequest, _: None = None):
+    if not _verify_pause_action_token(conv_id, body.paused, body.token):
+        raise HTTPException(status_code=403, detail="Invalid pause token")
+    detail = await Database.get_conversation_detail(conv_id)
+    if not detail:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    user_id = detail["user_id"]
+    external_id = detail["external_id"]
+    _set_paused_memory(external_id, body.paused)
+    await Database.set_user_paused(user_id, body.paused)
+    return {"ok": True, "paused": body.paused}
