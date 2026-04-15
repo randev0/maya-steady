@@ -1,0 +1,107 @@
+{% extends "base.html" %}
+{% block title %}Conversations{% endblock %}
+{% block heading %}Conversation Explorer{% endblock %}
+
+{% block content %}
+<div class="bg-white rounded-xl border border-gray-100 shadow-sm overflow-hidden">
+  <div class="overflow-x-auto">
+  <table class="min-w-full divide-y divide-gray-200">
+    <thead class="bg-gray-50">
+      <tr>
+        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">User</th>
+        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Channel</th>
+        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
+        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Score</th>
+        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Messages</th>
+        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Last Active</th>
+        <th class="px-4 py-3"></th>
+      </tr>
+    </thead>
+    <tbody class="bg-white divide-y divide-gray-100">
+      {% for c in conversations %}
+      <tr class="hover:bg-gray-50 transition">
+        <td class="px-4 py-3">
+          <div class="font-medium text-gray-900 text-sm">
+            {{ c.display_name or c.external_id }}
+          </div>
+          {% if c.display_name %}
+          <div class="text-xs text-gray-400">{{ c.external_id }}</div>
+          {% endif %}
+        </td>
+        <td class="px-4 py-3">
+          <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium
+            {% if c.channel == 'facebook' %}bg-blue-100 text-blue-700
+            {% elif c.channel == 'whatsapp' %}bg-green-100 text-green-700
+            {% else %}bg-gray-100 text-gray-600{% endif %}">
+            {{ c.channel }}
+          </span>
+        </td>
+        <td class="px-4 py-3">
+          <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium
+            {% if c.status == 'active' %}bg-emerald-100 text-emerald-700
+            {% elif c.status == 'handoff' %}bg-red-100 text-red-700
+            {% elif c.status == 'completed' %}bg-gray-100 text-gray-600
+            {% else %}bg-gray-100 text-gray-500{% endif %}">
+            {{ c.status }}
+          </span>
+        </td>
+        <td class="px-4 py-3">
+          {% if c.score_label %}
+          <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium
+            {% if c.score_label == 'qualified' %}bg-green-100 text-green-700
+            {% elif c.score_label == 'warm' %}bg-yellow-100 text-yellow-700
+            {% elif c.score_label == 'low_priority' %}bg-orange-100 text-orange-700
+            {% else %}bg-gray-100 text-gray-500{% endif %}">
+            {{ c.score }}/5 · {{ c.score_label }}
+          </span>
+          {% else %}
+          <span class="text-xs text-gray-400">—</span>
+          {% endif %}
+        </td>
+        <td class="px-4 py-3 text-sm text-gray-600">{{ c.message_count }}</td>
+        <td class="px-4 py-3 text-xs text-gray-400">
+          {{ c.last_message_at.strftime('%d %b %H:%M') if c.last_message_at else '—' }}
+        </td>
+        <td class="px-4 py-3 text-right flex items-center justify-end gap-3">
+          <a href="/conversations/{{ c.id }}"
+             class="text-blue-600 hover:text-blue-800 text-xs font-medium">View →</a>
+          <button onclick="deleteConv('{{ c.id }}')"
+                  class="text-red-400 hover:text-red-600 text-xs font-medium">Delete</button>
+        </td>
+      </tr>
+      {% else %}
+      <tr>
+        <td colspan="7" class="px-4 py-8 text-center text-gray-400 text-sm">
+          No conversations yet. Try the test chat on the Overview page.
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</div>
+
+<!-- Pagination -->
+<div class="flex justify-between mt-4">
+  {% if page > 1 %}
+  <a href="/conversations?page={{ page - 1 }}" class="text-sm text-blue-600 hover:underline">← Previous</a>
+  {% else %}<span></span>{% endif %}
+  {% if has_next %}
+  <a href="/conversations?page={{ page + 1 }}" class="text-sm text-blue-600 hover:underline">Next →</a>
+  {% endif %}
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+async function deleteConv(id) {
+  if (!confirm('Delete this conversation and all its messages?')) return;
+  const res = await fetch(`/api/conversations/${id}`, { method: 'DELETE' });
+  if (res.ok) {
+    document.querySelector(`button[onclick="deleteConv('${id}')"]`).closest('tr').remove();
+  } else {
+    alert('Delete failed');
+  }
+}
+</script>
+{% endblock %}

@@ -1,0 +1,12 @@
+.env
+.venv/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+*.sqlite3
+*.log
+
+wa_gateway/node_modules/
+wa_gateway/.wwebjs_cache/
+
+.DS_Store

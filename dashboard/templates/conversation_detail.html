@@ -1,0 +1,167 @@
+{% extends "base.html" %}
+{% block title %}Conversation Detail{% endblock %}
+{% block heading %}Conversation Detail{% endblock %}
+
+{% block content %}
+<div class="grid grid-cols-3 gap-6">
+
+  <!-- Chat history (left 2/3) -->
+  <div class="col-span-2">
+    <div class="bg-white rounded-xl border border-gray-100 shadow-sm p-4">
+      <div class="flex items-center justify-between mb-4">
+        <div>
+          <h2 class="font-semibold text-gray-900">{{ conv.display_name or conv.external_id }}</h2>
+          <p class="text-xs text-gray-400">{{ conv.channel }} · {{ conv.status }} · Started {{ conv.started_at.strftime('%d %b %Y %H:%M') }}</p>
+        </div>
+        <div class="flex items-center gap-2">
+          <span class="px-2 py-1 rounded text-xs font-medium
+            {% if conv.score_label == 'qualified' %}bg-green-100 text-green-700
+            {% elif conv.score_label == 'warm' %}bg-yellow-100 text-yellow-700
+            {% elif conv.score_label == 'low_priority' %}bg-orange-100 text-orange-700
+            {% else %}bg-gray-100 text-gray-500{% endif %}">
+            Score: {{ conv.score or 0 }}/5 · {{ conv.score_label or 'unqualified' }}
+          </span>
+          <!-- Maya pause/resume toggle -->
+          <div x-data="pauseToggle('{{ conv.id }}', {{ 'true' if maya_paused else 'false' }}, '{{ pause_token }}', '{{ resume_token }}')">
+            <button @click="toggle()"
+              :class="paused ? 'bg-green-500 hover:bg-green-600' : 'bg-orange-500 hover:bg-orange-600'"
+              class="text-white text-xs px-3 py-1.5 rounded transition font-medium">
+              <span x-text="paused ? '▶ Resume Maya' : '⏸ Pause Maya'"></span>
+            </button>
+            <p x-show="msg" x-text="msg" class="text-xs text-gray-500 mt-1 text-right"></p>
+          </div>
+        </div>
+      </div>
+
+      <div class="space-y-3 max-h-[60vh] overflow-y-auto pr-1">
+        {% for msg in conv.messages %}
+        <div class="{% if msg.role == 'user' %}text-right{% else %}text-left{% endif %}">
+          <span class="inline-block max-w-md text-sm px-3 py-2 rounded-2xl
+            {% if msg.source == 'admin' %}bg-purple-100 text-purple-800 border border-purple-200
+            {% elif msg.source == 'customer_paused' %}bg-blue-200 text-blue-900
+            {% elif msg.source == 'catchup' %}bg-yellow-50 text-yellow-800 border border-yellow-200 text-xs italic
+            {% elif msg.role == 'user' %}bg-blue-500 text-white
+            {% else %}bg-gray-100 text-gray-800{% endif %}">
+            {{ msg.content }}
+          </span>
+          <p class="text-xs text-gray-400 mt-1">
+            {% if msg.source == 'admin' %}admin reply
+            {% elif msg.source == 'customer_paused' %}customer (paused)
+            {% elif msg.source == 'catchup' %}catch-up context
+            {% else %}{{ msg.role }}{% endif %}
+            · {{ msg.created_at.strftime('%H:%M') }}
+          </p>
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+  </div>
+
+  <!-- Facts & audit (right 1/3) -->
+  <div class="space-y-4">
+    <!-- Structured facts -->
+    <div class="bg-white rounded-xl border border-gray-100 shadow-sm p-4"
+         x-data="factsEditor({{ conv.facts | tojson }}, '{{ conv.user_id }}')">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="font-semibold text-sm text-gray-900">Structured Facts</h3>
+        <button @click="editing = !editing" class="text-xs text-blue-600 hover:underline">
+          <span x-text="editing ? 'Cancel' : 'Edit'"></span>
+        </button>
+      </div>
+
+      <!-- View mode -->
+      <div x-show="!editing" class="space-y-2">
+        {% for key, value in conv.facts.items() %}
+        <div class="flex justify-between text-sm">
+          <span class="text-gray-500 capitalize">{{ key.replace('_', ' ') }}</span>
+          <span class="font-medium text-gray-800">{{ value }}</span>
+        </div>
+        {% else %}
+        <p class="text-xs text-gray-400">No facts collected yet.</p>
+        {% endfor %}
+      </div>
+
+      <!-- Edit mode -->
+      <div x-show="editing" class="space-y-2">
+        <template x-for="(val, key) in facts" :key="key">
+          <div class="flex gap-2">
+            <input :value="key" readonly class="w-1/2 text-xs border border-gray-200 rounded px-2 py-1 bg-gray-50"/>
+            <input x-model="facts[key]" class="w-1/2 text-xs border border-gray-300 rounded px-2 py-1 focus:outline-none focus:ring-1 focus:ring-blue-400"/>
+          </div>
+        </template>
+        <button @click="save()" class="w-full mt-2 bg-blue-500 text-white text-xs py-1.5 rounded hover:bg-blue-600 transition">
+          Save Changes
+        </button>
+        <p x-show="saved" class="text-xs text-green-600 text-center">✓ Saved</p>
+      </div>
+    </div>
+
+    <!-- Facts audit log -->
+    <div class="bg-white rounded-xl border border-gray-100 shadow-sm p-4">
+      <h3 class="font-semibold text-sm text-gray-900 mb-3">Facts Audit Log</h3>
+      <div class="space-y-2 max-h-64 overflow-y-auto">
+        {% for entry in audit %}
+        <div class="text-xs border-l-2 border-gray-200 pl-2">
+          <p class="font-medium text-gray-700">{{ entry.field_name }}</p>
+          <p class="text-gray-400">
+            {{ entry.old_value or '—' }} → {{ entry.new_value }}
+            <span class="ml-1 {% if entry.changed_by == 'admin' %}text-orange-500{% else %}text-gray-400{% endif %}">({{ entry.changed_by }})</span>
+          </p>
+          <p class="text-gray-300">{{ entry.changed_at.strftime('%d %b %H:%M') }}</p>
+        </div>
+        {% else %}
+        <p class="text-xs text-gray-400">No changes recorded.</p>
+        {% endfor %}
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+function pauseToggle(convId, initialPaused, pauseToken, resumeToken) {
+  return {
+    paused: initialPaused,
+    msg: '',
+    async toggle() {
+      const nextPaused = !this.paused;
+      const token = nextPaused ? pauseToken : resumeToken;
+      const res = await fetch(`/api/wa/pause/${convId}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ paused: nextPaused, token })
+      });
+      if (res.ok) {
+        this.paused = nextPaused;
+        this.msg = this.paused ? 'Maya paused' : 'Maya resumed';
+        setTimeout(() => this.msg = '', 3000);
+      }
+    }
+  }
+}
+
+function factsEditor(initialFacts, userId) {
+  return {
+    facts: { ...initialFacts },
+    editing: false,
+    saved: false,
+    async save() {
+      const res = await fetch(`/api/leads/${userId}/facts`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ facts: this.facts })
+      });
+      if (res.ok) {
+        this.editing = false;
+        this.saved = true;
+        setTimeout(() => this.saved = false, 3000);
+      }
+    }
+  }
+}
+</script>
+
+<div class="mt-4">
+  <a href="/conversations" class="text-sm text-blue-600 hover:underline">← Back to Conversations</a>
+</div>
+{% endblock %}

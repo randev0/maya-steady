@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+
+{% block content %}
+
+<h1>Analytics Dashboard</h1>
+
+<p>Here's a summary of Maya's performance:</p>
+
+<table border="1">
+    <thead>
+        <tr>
+            <th>Metric</th>
+            <th>Value</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>Total Conversations</td>
+            <td>{{ analytics.total_conversations }}</td>
+        </tr>
+        <tr>
+            <td>Total Leads</td>
+            <td>{{ analytics.total_leads }}</td>
+        </tr>
+        <tr>
+            <td>Pending Handoffs</td>
+            <td>{{ analytics.pending_handoffs }}</td>
+        </tr>
+    </tbody>
+</table>
+
+<p>More detailed analytics will be added here soon.</p>
+
+{% endblock %}

@@ -1,0 +1,74 @@
+{% extends "base.html" %}
+
+{% block title %}Learning Loop{% endblock %}
+{% block heading %}Maya — Learning Loop{% endblock %}
+
+{% block content %}
+<div class="space-y-6">
+
+  <!-- Stats row -->
+  <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+    <div class="bg-white rounded-lg shadow-sm p-5 border border-gray-100">
+      <p class="text-xs text-gray-500 uppercase tracking-wide font-medium">Skills Learned</p>
+      <p class="mt-1 text-3xl font-bold text-indigo-600">{{ stats.total_skills }}</p>
+    </div>
+    <div class="bg-white rounded-lg shadow-sm p-5 border border-gray-100">
+      <p class="text-xs text-gray-500 uppercase tracking-wide font-medium">Outcomes Recorded</p>
+      <p class="mt-1 text-3xl font-bold text-gray-800">{{ stats.total_outcomes_recorded }}</p>
+    </div>
+    <div class="bg-white rounded-lg shadow-sm p-5 border border-gray-100">
+      <p class="text-xs text-gray-500 uppercase tracking-wide font-medium">Conversion Rate</p>
+      <p class="mt-1 text-3xl font-bold text-green-600">{{ stats.conversion_rate }}%</p>
+    </div>
+    <div class="bg-white rounded-lg shadow-sm p-5 border border-gray-100">
+      <p class="text-xs text-gray-500 uppercase tracking-wide font-medium">Avg Turns to Convert</p>
+      <p class="mt-1 text-3xl font-bold text-gray-800">{{ stats.avg_turns_to_convert }}</p>
+    </div>
+  </div>
+
+  <!-- Top performing skills -->
+  <div class="bg-white rounded-lg shadow-sm border border-gray-100">
+    <div class="px-5 py-4 border-b border-gray-100 flex items-center justify-between">
+      <h2 class="text-sm font-semibold text-gray-700">Top Performing Skills</h2>
+      <span class="text-xs text-gray-400">Ranked by success rate</span>
+    </div>
+    {% if stats.top_skills %}
+    <div class="divide-y divide-gray-50">
+      {% for skill in stats.top_skills %}
+      <div class="px-5 py-4">
+        <div class="flex items-start justify-between gap-4">
+          <div class="flex-1 min-w-0">
+            <p class="text-xs font-medium text-indigo-600 uppercase tracking-wide mb-1">
+              {{ skill.situation_summary }}
+            </p>
+            <p class="text-sm text-gray-700">{{ skill.approach }}</p>
+          </div>
+          <div class="text-right shrink-0">
+            <p class="text-lg font-bold text-green-600">{{ skill.success_pct }}%</p>
+            <p class="text-xs text-gray-400">{{ skill.success_count }}/{{ skill.use_count }} used</p>
+          </div>
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+    {% else %}
+    <div class="px-5 py-10 text-center text-gray-400 text-sm">
+      No skills with usage data yet — Maya is still building experience from conversations.
+    </div>
+    {% endif %}
+  </div>
+
+  <!-- How it works -->
+  <div class="bg-indigo-50 border border-indigo-100 rounded-lg px-5 py-4">
+    <h3 class="text-sm font-semibold text-indigo-700 mb-2">How the Learning Loop Works</h3>
+    <ol class="text-sm text-indigo-600 space-y-1 list-decimal list-inside">
+      <li>Every turn, Maya retrieves skills matching the current situation (passive user, product seller, etc.)</li>
+      <li>She incorporates the top tactics into her reply strategy</li>
+      <li>When a conversation converts (handoff triggered), the outcome is recorded</li>
+      <li>Skills used in successful conversations get their success count incremented</li>
+      <li>Over time, Maya learns which approaches work best for which situations</li>
+    </ol>
+  </div>
+
+</div>
+{% endblock %}

@@ -1,0 +1,114 @@
+# LeadQualBot — Kubernetes routing manifests
+# Routes agent.steadigital.com → host process on port 8080
+# Uses existing Traefik ingress controller + cert-manager (letsencrypt-prod)
+#
+# Deploy: kubectl apply -f k8s/agent-ingress.yaml
+# Remove:  kubectl delete -f k8s/agent-ingress.yaml
+
+---
+# BasicAuth secret — generate credentials:
+#   htpasswd -nb admin YOUR_PASSWORD
+# Then base64-encode the output:
+#   echo -n 'admin:$apr1$...' | base64
+# Paste the result into data.users below.
+# NOTE: leave a trailing newline inside the htpasswd string.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: agent-basicauth-secret
+  namespace: platform
+type: Opaque
+stringData:
+  # Regenerate with: htpasswd -nb -B admin YOUR_NEW_PASSWORD
+  # Then paste the output directly here (stringData handles encoding automatically)
+  users: "REPLACE_WITH_HTPASSWD_OUTPUT"
+
+---
+# Traefik Middleware — enforces basic auth on all routes
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: agent-basicauth
+  namespace: platform
+spec:
+  basicAuth:
+    secret: agent-basicauth-secret
+    removeHeader: true
+
+---
+# Traefik Middleware — security headers
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: agent-security-headers
+  namespace: platform
+spec:
+  headers:
+    frameDeny: true
+    contentTypeNosniff: true
+    browserXssFilter: true
+    referrerPolicy: "strict-origin-when-cross-origin"
+    customResponseHeaders:
+      X-Robots-Tag: "noindex, nofollow"
+
+---
+# Headless Service (no selector — we manage Endpoints manually)
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-external
+  namespace: platform
+spec:
+  clusterIP: None
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      protocol: TCP
+
+---
+# Endpoints — points to the uvicorn process on the host (node IP)
+# NODE_IP is the VPS public IP: 89.167.95.204
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: agent-external
+  namespace: platform
+subsets:
+  - addresses:
+      - ip: 89.167.95.204
+    ports:
+      - name: http
+        port: 8080
+        protocol: TCP
+
+---
+# Ingress — cert-manager issues Let's Encrypt cert automatically
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: agent-ingress
+  namespace: platform
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: web,websecure
+    traefik.ingress.kubernetes.io/router.middlewares: >-
+      platform-agent-basicauth@kubernetescrd,
+      platform-agent-security-headers@kubernetescrd
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts:
+        - agent.steadigital.com
+      secretName: agent-steadigital-tls
+  rules:
+    - host: agent.steadigital.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: agent-external
+                port:
+                  number: 8080

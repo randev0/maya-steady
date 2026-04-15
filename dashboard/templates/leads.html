@@ -1,0 +1,106 @@
+{% extends "base.html" %}
+{% block title %}Leads{% endblock %}
+{% block heading %}Lead Profiles{% endblock %}
+
+{% block content %}
+<div class="bg-white rounded-xl border border-gray-100 shadow-sm overflow-hidden">
+  <div class="overflow-x-auto">
+  <table class="min-w-full divide-y divide-gray-200">
+    <thead class="bg-gray-50">
+      <tr>
+        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Contact</th>
+        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Service</th>
+        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Budget</th>
+        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Timeline</th>
+        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Score</th>
+        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Channel</th>
+        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Since</th>
+      </tr>
+    </thead>
+    <tbody class="bg-white divide-y divide-gray-100">
+      {% set budget_labels = {
+        'below_rm2k': '< RM2k',
+        'rm2k_rm5k': 'RM2k–5k',
+        'rm5k_rm10k': 'RM5k–10k',
+        'rm10k_plus': 'RM10k+'
+      } %}
+      {% set timeline_labels = {
+        'immediately': 'Immediately',
+        'within_1_month': '< 1 month',
+        '1_3_months': '1–3 months',
+        '3_6_months': '3–6 months',
+        'flexible': 'Flexible'
+      } %}
+      {% for lead in leads %}
+      <tr class="hover:bg-gray-50 transition">
+        <td class="px-4 py-3">
+          <div class="font-medium text-sm text-gray-900">
+            {{ lead.facts.get('contact_name') or lead.display_name or lead.external_id }}
+          </div>
+          {% if lead.facts.get('preferred_contact') %}
+          <div class="text-xs text-gray-400">{{ lead.facts.get('preferred_contact') }}</div>
+          {% endif %}
+        </td>
+        <td class="px-4 py-3 text-sm text-gray-600">
+          {{ lead.facts.get('service_interest', '—') }}
+        </td>
+        <td class="px-4 py-3 text-sm text-gray-600">
+          {{ budget_labels.get(lead.facts.get('budget_range', ''), lead.facts.get('budget_range', '—')) }}
+        </td>
+        <td class="px-4 py-3 text-sm text-gray-600">
+          {{ timeline_labels.get(lead.facts.get('timeline', ''), lead.facts.get('timeline', '—')) }}
+        </td>
+        <td class="px-4 py-3">
+          <div class="flex items-center gap-1.5">
+            <!-- Score bar -->
+            <div class="w-16 bg-gray-100 rounded-full h-1.5">
+              <div class="h-1.5 rounded-full
+                {% if lead.score_label == 'qualified' %}bg-green-500
+                {% elif lead.score_label == 'warm' %}bg-yellow-400
+                {% elif lead.score_label == 'low_priority' %}bg-orange-400
+                {% else %}bg-gray-300{% endif %}"
+                style="width: {{ (lead.score / 5 * 100) | int }}%"></div>
+            </div>
+            <span class="text-xs font-medium
+              {% if lead.score_label == 'qualified' %}text-green-600
+              {% elif lead.score_label == 'warm' %}text-yellow-600
+              {% elif lead.score_label == 'low_priority' %}text-orange-600
+              {% else %}text-gray-400{% endif %}">
+              {{ lead.score }}/5
+            </span>
+          </div>
+          <p class="text-xs text-gray-400 mt-0.5 capitalize">{{ lead.score_label }}</p>
+        </td>
+        <td class="px-4 py-3">
+          <span class="inline-flex px-2 py-0.5 rounded text-xs font-medium
+            {% if lead.channel == 'facebook' %}bg-blue-100 text-blue-700
+            {% elif lead.channel == 'whatsapp' %}bg-green-100 text-green-700
+            {% else %}bg-gray-100 text-gray-600{% endif %}">
+            {{ lead.channel }}
+          </span>
+        </td>
+        <td class="px-4 py-3 text-xs text-gray-400">
+          {{ lead.created_at.strftime('%d %b %Y') if lead.created_at else '—' }}
+        </td>
+      </tr>
+      {% else %}
+      <tr>
+        <td colspan="7" class="px-4 py-8 text-center text-gray-400 text-sm">
+          No leads yet. Conversations with collected facts will appear here.
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</div>
+
+<div class="flex justify-between mt-4">
+  {% if page > 1 %}
+  <a href="/leads?page={{ page - 1 }}" class="text-sm text-blue-600 hover:underline">← Previous</a>
+  {% else %}<span></span>{% endif %}
+  {% if has_next %}
+  <a href="/leads?page={{ page + 1 }}" class="text-sm text-blue-600 hover:underline">Next →</a>
+  {% endif %}
+</div>
+{% endblock %}
