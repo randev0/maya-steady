@@ -11,7 +11,6 @@ import asyncio
 from contextlib import asynccontextmanager, suppress
 import structlog
 import httpx
-from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID
 from typing import Optional
@@ -33,6 +32,25 @@ from app_support.followups import (
     dispatch_due_followups_once,
     followup_dispatcher_loop,
     release_followup_dispatch_lock,
+)
+from app_support.whatsapp import (
+    WhatsAppRuntimeState,
+    check_trial_gate as whatsapp_check_trial_gate,
+    detect_manager_command as whatsapp_detect_manager_command,
+    enqueue_message as whatsapp_enqueue_message,
+    execute_manager_command as whatsapp_execute_manager_command,
+    format_catchup as whatsapp_format_catchup,
+    handle_as_prospect as whatsapp_handle_as_prospect,
+    handle_manager as whatsapp_handle_manager,
+    handle_message as whatsapp_handle_message,
+    handle_unsupported as whatsapp_handle_unsupported,
+    is_manager as whatsapp_is_manager,
+    is_paused as whatsapp_is_paused,
+    notify_handoff_admins as whatsapp_notify_handoff_admins,
+    send_text_via_gateway as whatsapp_send_text,
+    set_paused_memory as whatsapp_set_paused_memory,
+    shadow_log_customer as whatsapp_shadow_log_customer,
+    store_outbound_message as whatsapp_store_outbound_message,
 )
 from app_support.security import (
     build_pause_action_token,
@@ -215,36 +233,17 @@ async def _send_fb_reply(recipient_id: str, text: str):
 # ------------------------------------------------------------------ #
 
 # Debounce state: sender_id -> (pending_task, accumulated_texts, display_name)
-_wa_debounce: dict[str, asyncio.Task] = {}
-_wa_buffer: dict[str, list[str]] = {}
-_wa_name: dict[str, Optional[str]] = {}
 WA_DEBOUNCE_SECONDS = 15  # wait this long after last message before replying
-
-# Human takeover pause — bare numbers (without @c.us/@lid) currently paused
-# Populated from DB on startup and kept in sync by pause/unpause actions
-_wa_paused_set: set[str] = set()
-
-# Prospect test mode — when True, manager messages are routed through the sales agent
-_wa_prospect_mode: bool = False
+_wa_state = WhatsAppRuntimeState()
 _PROSPECT_TEST_ID = "prospect_test_internal"
-
-ADMIN_WA_NUMBERS: list[str] = settings.admin_wa_numbers
-DASHBOARD_URL: str = settings.dashboard_url
 
 
 def _is_paused(sender_id: str) -> bool:
-    normalized = normalize_whatsapp_id(sender_id)
-    return bool(normalized and normalized in _wa_paused_set)
+    return whatsapp_is_paused(_wa_state, sender_id)
 
 
 def _set_paused_memory(external_id: str, paused: bool) -> None:
-    bare = normalize_whatsapp_id(external_id)
-    if not bare:
-        return
-    if paused:
-        _wa_paused_set.add(bare)
-    else:
-        _wa_paused_set.discard(bare)
+    whatsapp_set_paused_memory(_wa_state, external_id, paused)
 
 
 _extract_admin_token = extract_admin_token
@@ -254,34 +253,19 @@ _verify_pause_action_token = verify_pause_action_token
 
 
 def _wa_enqueue(sender_id: str, text: str, name: Optional[str]) -> None:
-    """Buffer a message and (re)start the debounce timer for this sender."""
-    # Manager messages bypass debounce — fire immediately
-    if _is_manager(sender_id):
-        asyncio.create_task(_wa_handle_message(sender_id, text, name))
-        return
-
-    # Paused conversations bypass debounce — shadow-log each message individually
-    if _is_paused(sender_id):
-        asyncio.create_task(_wa_shadow_log_customer(sender_id, text, name))
-        return
-
-    _wa_buffer.setdefault(sender_id, []).append(text)
-    if name:
-        _wa_name[sender_id] = name
-
-    existing = _wa_debounce.get(sender_id)
-    if existing and not existing.done():
-        existing.cancel()
-
-    async def _fire(sid: str):
-        await asyncio.sleep(WA_DEBOUNCE_SECONDS)
-        texts = _wa_buffer.pop(sid, [])
-        display_name = _wa_name.pop(sid, None)
-        _wa_debounce.pop(sid, None)
-        if texts:
-            await _wa_handle_message(sid, " ".join(texts), display_name)
-
-    _wa_debounce[sender_id] = asyncio.create_task(_fire(sender_id))
+    asyncio.create_task(
+        whatsapp_enqueue_message(
+            state=_wa_state,
+            sender_id=sender_id,
+            text=text,
+            name=name,
+            debounce_seconds=WA_DEBOUNCE_SECONDS,
+            is_manager_fn=_is_manager,
+            is_paused_fn=_is_paused,
+            handle_message=_wa_handle_message,
+            shadow_log_customer=_wa_shadow_log_customer,
+        )
+    )
 
 
 @app.post("/webhook/whatsapp")
@@ -331,18 +315,7 @@ async def wa_webhook(request: Request):
 
 
 async def _wa_shadow_log_customer(sender_id: str, text: str, name: Optional[str]) -> None:
-    """Store a customer message received while Maya is paused — no agent processing."""
-    try:
-        user = await Database.get_or_create_user(sender_id, "whatsapp")
-        if name and not user.get("display_name"):
-            await Database.update_user_display_name(user["id"], name)
-        conv = await Database.get_active_conversation(user["id"])
-        if not conv:
-            conv = await Database.create_conversation(user["id"])
-        await Database.store_message(conv["id"], "user", text, source="customer_paused")
-        log.info("shadow_log_customer", sender_id=sender_id, preview=text[:60])
-    except Exception as exc:
-        log.error("shadow_log_customer_error", sender_id=sender_id, error=str(exc))
+    await whatsapp_shadow_log_customer(Database, log, sender_id, text, name)
 
 
 async def _store_outbound_message(
@@ -353,22 +326,11 @@ async def _store_outbound_message(
     source: str = "maya",
 ) -> Optional[dict]:
     """Persist an outbound customer-facing message before transport send."""
-    user = await Database.get_or_create_user(external_id, channel)
-    conv = {"id": conversation_id} if conversation_id else await Database.get_active_conversation(user["id"])
-    if not conv:
-        conv = await Database.create_conversation(user["id"])
-    return await Database.store_message(conv["id"], "assistant", text, source=source)
+    return await whatsapp_store_outbound_message(Database, external_id, channel, text, conversation_id, source)
 
 
 def _format_catchup(shadow_messages: list) -> str:
-    """Format shadow messages into a catch-up context block injected before Maya resumes."""
-    lines = ["[ADMIN TAKEOVER — o below is what happened while Maya was paused. Resume naturally.]"]
-    for m in shadow_messages:
-        source = m.get("source", "")
-        label = "Admin" if source == "admin" else "Customer"
-        lines.append(f"{label}: {m['content']}")
-    lines.append("[Maya resuming now]")
-    return "\n".join(lines)
+    return whatsapp_format_catchup(shadow_messages)
 
 
 class AdminReplyMessage(BaseModel):
@@ -416,307 +378,99 @@ async def set_pause_by_conv(conv_id: UUID, body: PauseRequest, _: None = Depends
 
 
 def _is_manager(sender_id: str) -> bool:
-    """Check if the sender is the configured manager/owner."""
-    mgr = settings.manager_wa_id
-    if not mgr:
-        return False
-    return normalize_whatsapp_id(sender_id) == normalize_whatsapp_id(mgr)
-
-
-_MANAGER_COMMANDS = {
-    "prospect on":    "prospect_on",
-    "/prospect on":   "prospect_on",
-    "prospect off":   "prospect_off",
-    "prospect stop":  "prospect_off",
-    "/prospect off":  "prospect_off",
-    "/prospect stop": "prospect_off",
-    "prospect reset": "prospect_reset",
-    "/prospect reset":"prospect_reset",
-    "reload":         "reload",
-    "/reload":        "reload",
-    "reload prompt":  "reload",
-    "show prompt":    "show_prompt",
-    "/show prompt":   "show_prompt",
-    "show rules":     "show_rules",
-    "/show rules":    "show_rules",
-}
+    return whatsapp_is_manager(settings, sender_id)
 
 
 def _detect_manager_command(text: str) -> Optional[str]:
-    t = text.strip().lower()
-    if t in _MANAGER_COMMANDS:
-        return _MANAGER_COMMANDS[t]
-    if t.startswith("add rule:") or t.startswith("/add rule:"):
-        return "add_rule"
-    return None
+    return whatsapp_detect_manager_command(text)
 
 
 async def _execute_manager_command(sender_id: str, command: str, raw_text: str) -> None:
-    global _wa_prospect_mode
-
-    if command == "prospect_on":
-        _wa_prospect_mode = True
-        await _wa_send_text(
-            sender_id,
-            "Prospect mode ON. Your messages will now go to Maya as a fresh lead.\n\n"
-            "Commands while in prospect mode:\n"
-            "- 'prospect off' — exit and return to manager mode\n"
-            "- 'prospect reset' — clear test conversation history",
-        )
-
-    elif command == "prospect_off":
-        _wa_prospect_mode = False
-        await _wa_send_text(sender_id, "Prospect mode OFF. Back to manager mode.")
-
-    elif command == "prospect_reset":
-        try:
-            user = await Database.get_or_create_user(_PROSPECT_TEST_ID, "whatsapp")
-            conv = await Database.get_active_conversation(user["id"])
-            if conv:
-                await Database.delete_conversation(conv["id"])
-                await _wa_send_text(sender_id, "Prospect test conversation cleared. Fresh start on next 'prospect on'.")
-            else:
-                await _wa_send_text(sender_id, "No active prospect test conversation to clear.")
-        except Exception as exc:
-            await _wa_send_text(sender_id, f"Reset failed: {str(exc)[:150]}")
-
-    elif command == "reload":
-        try:
-            reload_prompt()
-            await _wa_send_text(sender_id, "System prompt reloaded from file.")
-        except Exception as exc:
-            await _wa_send_text(sender_id, f"Reload failed: {str(exc)[:150]}")
-
-    elif command == "show_prompt":
-        try:
-            content = (_AGENT_CONFIG_DIR / "system_prompt.md").read_text()
-            await _wa_send_text(sender_id, content)
-        except Exception as exc:
-            await _wa_send_text(sender_id, f"Error reading prompt: {str(exc)}")
-
-    elif command == "show_rules":
-        try:
-            content = (_AGENT_CONFIG_DIR / "system_prompt.md").read_text()
-            start = content.find("## NEVER")
-            if start == -1:
-                await _wa_send_text(sender_id, "NEVER section not found.")
-                return
-            end = content.find("\n---\n", start)
-            section = content[start:end].strip() if end != -1 else content[start:].strip()
-            await _wa_send_text(sender_id, section)
-        except Exception as exc:
-            await _wa_send_text(sender_id, f"Error: {str(exc)}")
-
-    elif command == "add_rule":
-        colon_idx = raw_text.lower().find("add rule:")
-        rule_text = raw_text[colon_idx + len("add rule:"):].strip()
-        if not rule_text:
-            await _wa_send_text(sender_id, "Usage: add rule: <your rule here>")
-            return
-        try:
-            path = _AGENT_CONFIG_DIR / "system_prompt.md"
-            content = path.read_text()
-            never_idx = content.find("## NEVER\n")
-            if never_idx == -1:
-                await _wa_send_text(sender_id, "NEVER section not found in prompt.")
-                return
-            end_marker = content.find("\n---\n", never_idx)
-            insert_pos = end_marker if end_marker != -1 else len(content)
-            new_content = content[:insert_pos] + f"- {rule_text}\n" + content[insert_pos:]
-            path.write_text(new_content)
-            reload_prompt()
-            await _wa_send_text(sender_id, f"Rule added and prompt reloaded:\n- {rule_text}")
-        except Exception as exc:
-            await _wa_send_text(sender_id, f"Error adding rule: {str(exc)[:150]}")
+    await whatsapp_execute_manager_command(
+        state=_wa_state,
+        db=Database,
+        agent=agent,
+        send_text=_wa_send_text,
+        reload_prompt=reload_prompt,
+        prompt_dir=_AGENT_CONFIG_DIR,
+        sender_id=sender_id,
+        command=command,
+        raw_text=raw_text,
+        log=log,
+        fallback_reply=_FALLBACK_REPLY,
+        prospect_test_id=_PROSPECT_TEST_ID,
+    )
 
 
 async def _wa_handle_as_prospect(manager_id: str, text: str, name: Optional[str]) -> None:
-    """Route manager through the normal sales agent using a clean test external_id."""
-    try:
-        reply = await agent.process_message(
-            external_id=_PROSPECT_TEST_ID,
-            message=text,
-            channel="whatsapp",
-        )
-        parts = [p.strip() for p in reply.split("\n---\n") if p.strip()]
-        for i, part in enumerate(parts):
-            await _wa_send_text(manager_id, part)
-            if i < len(parts) - 1:
-                await asyncio.sleep(1.5)
-    except AgentError as exc:
-        await _wa_send_text(manager_id, f"[Maya error in prospect test: {str(exc)[:150]}]")
-    except Exception as exc:
-        log.error("prospect_test_error", error=str(exc))
-        await _wa_send_text(manager_id, f"[Error: {str(exc)[:150]}]")
+    await whatsapp_handle_as_prospect(
+        agent=agent,
+        send_text=_wa_send_text,
+        manager_id=manager_id,
+        text=text,
+        prospect_test_id=_PROSPECT_TEST_ID,
+        log=log,
+    )
 
 
 async def _wa_handle_manager(sender_id: str, text: str):
-    """Handle a message from the business owner — reporting mode."""
-    log.info("manager_message_received", sender_id=sender_id, preview=text[:80])
-    try:
-        reply = await process_manager_message(text)
-        await _wa_send_text(sender_id, reply)
-    except Exception as exc:
-        log.error("manager_handler_error", error=str(exc))
-        try:
-            await _wa_send_text(sender_id, f"Error: {str(exc)[:200]}")
-        except Exception:
-            pass
+    await whatsapp_handle_manager(
+        process_manager_message=process_manager_message,
+        send_text=_wa_send_text,
+        sender_id=sender_id,
+        text=text,
+        log=log,
+    )
 
 
 async def _check_trial_gate(sender_id: str) -> Optional[str]:
-    """
-    If user is on a trial, enforce daily message limit and 7-day expiry.
-    Returns a block message to send, or None if the user can proceed.
-    """
-    user = await Database.get_or_create_user(sender_id, "whatsapp")
-    facts = await Database.get_user_facts(user["id"])
-
-    if not facts.get("trial_active"):
-        return None
-
-    # Check 7-day expiry
-    trial_start = facts.get("trial_start")
-    if trial_start:
-        try:
-            start_dt = datetime.fromisoformat(trial_start).replace(tzinfo=timezone.utc)
-            days_elapsed = (datetime.now(timezone.utc) - start_dt).days
-            if days_elapsed >= 7:
-                log.info("trial_expired", sender_id=sender_id, days=days_elapsed)
-                return (
-                    "Hey! Trial 7 hari you dah tamat. "
-                    "Nak sambung guna AI agent ni? Set up meeting dengan team kita — "
-                    "taip \"nak proceed\" dan kita akan reach out."
-                )
-        except (ValueError, TypeError):
-            pass
-
-    # Check daily message limit
-    count = await Database.count_user_messages_today(user["id"])
-    limit = settings.trial_daily_message_limit
-    if count >= limit:
-        log.info("trial_limit_reached", sender_id=sender_id, count=count, limit=limit)
-        return (
-            f"You dah guna {limit} messages untuk hari ni — tu limit trial you. "
-            "Cuba lagi esok, atau taip \"nak proceed\" kalau nak full setup."
-        )
-
-    return None
+    return await whatsapp_check_trial_gate(db=Database, settings=settings, log=log, sender_id=sender_id)
 
 
 async def _notify_handoff_admins(external_id: str, user_id: UUID, conv_id: Optional[UUID], reason: str, priority: str, notes: Optional[str], display: str) -> None:
-    """Send WA message to each admin number when Maya hands off a lead."""
-    priority_label = {"high": "🔴 HIGH", "medium": "🟡 MEDIUM", "low": "🟢 LOW"}.get(priority, priority.upper())
-    reason_str = reason.replace("_", " ").title()
-    conv_url = f"{DASHBOARD_URL}/conversations/{conv_id}" if conv_id else DASHBOARD_URL
-    lines = [
-        f"🔔 Lead Handoff — Maya needs you",
-        f"Customer: {display}",
-        f"Priority: {priority_label}",
-        f"Reason: {reason_str}",
-    ]
-    if notes:
-        lines.append(f"Notes: {notes[:150]}")
-    lines += ["", f"Manage in dashboard: {conv_url}"]
-    msg = "\n".join(lines)
-    for admin_num in ADMIN_WA_NUMBERS:
-        try:
-            await _wa_send_text(admin_num, msg)
-        except Exception as exc:
-            log.warning("admin_wa_notify_failed", admin=admin_num, error=str(exc))
+    await whatsapp_notify_handoff_admins(
+        settings=settings,
+        send_text=_wa_send_text,
+        conv_id=conv_id,
+        reason=reason,
+        priority=priority,
+        notes=notes,
+        display=display,
+        log=log,
+    )
 
 
 async def _wa_handle_message(sender_id: str, text: str, name: Optional[str]):
-    """Process an inbound WhatsApp message and send Maya's reply."""
-    # Manager bypass — commands always checked first regardless of mode
-    if _is_manager(sender_id):
-        cmd = _detect_manager_command(text)
-        if cmd:
-            await _execute_manager_command(sender_id, cmd, text)
-            return
-        if _wa_prospect_mode:
-            await _wa_handle_as_prospect(sender_id, text, name)
-        else:
-            await _wa_handle_manager(sender_id, text)
-        return
-
-    display = name or sender_id
-
-    # Edge case: admin may have replied during the debounce window — check again
-    if _is_paused(sender_id):
-        user = await Database.get_or_create_user(sender_id, "whatsapp")
-        conv = await Database.get_active_conversation(user["id"])
-        if conv:
-            await Database.store_message(conv["id"], "user", text, source="customer_paused")
-        log.info("message_dropped_paused_during_debounce", sender_id=sender_id)
-        return
-
-    try:
-        # Trial gate — check before touching the agent
-        block_msg = await _check_trial_gate(sender_id)
-        if block_msg:
-            await _store_outbound_message(sender_id, "whatsapp", block_msg)
-            await _wa_send_text(sender_id, block_msg)
-            return
-        # Store display name on first contact
-        if name:
-            user = await Database.get_or_create_user(sender_id, "whatsapp")
-            if not user.get("display_name"):
-                await Database.update_user_display_name(user["id"], name)
-
-        user = await Database.get_or_create_user(sender_id, "whatsapp")
-
-        # Catch-up injection: if we just resumed from a pause, inject shadow log as context
-        pause = await Database.get_pause_state(user["id"])
-        if pause["paused_at"] and not pause["paused"]:
-            conv = await Database.get_active_conversation(user["id"])
-            if conv:
-                shadow = await Database.get_shadow_messages(conv["id"], pause["paused_at"])
-                if shadow:
-                    catchup = _format_catchup(shadow)
-                    await Database.store_message(conv["id"], "user", catchup, source="catchup")
-                    log.info("catchup_injected", sender_id=sender_id, shadow_count=len(shadow))
-            await Database.clear_pause_history(user["id"])
-
-        # Alert owner only on first message of a new conversation
-        conv = await Database.get_active_conversation(user["id"])
-        is_new = conv is None or (await Database.get_conversation_history(conv["id"], limit=1)) == []
-        if is_new:
-            asyncio.create_task(_tg_alert(
-                f"💬 <b>New conversation</b> — {display}\n{text[:200]}"
-            ))
-
-        reply = await agent.process_message(
-            external_id=sender_id,
-            message=text,
-            channel="whatsapp",
-        )
-        parts = [p.strip() for p in reply.split("\n---\n") if p.strip()]
-        for i, part in enumerate(parts):
-            await _wa_send_text(sender_id, part)
-            if i < len(parts) - 1:
-                await asyncio.sleep(1.5)
-
-    except Exception as exc:
-        log.error("wa_message_handling_error", error=str(exc))
-        asyncio.create_task(_tg_alert(
-            f"⚠️ <b>Maya error</b> — {display}\nMessage: {text[:200]}\n<code>{str(exc)[:300]}</code>"
-        ))
-        try:
-            await _store_outbound_message(sender_id, "whatsapp", _FALLBACK_REPLY)
-            await _wa_send_text(sender_id, _FALLBACK_REPLY)
-        except Exception as send_exc:
-            log.error("wa_fallback_send_failed", sender_id=sender_id, error=str(send_exc))
+    await whatsapp_handle_message(
+        state=_wa_state,
+        db=Database,
+        settings=settings,
+        agent=agent,
+        send_text=_wa_send_text,
+        store_outbound_message_fn=_store_outbound_message,
+        tg_alert=_tg_alert,
+        process_manager_message=process_manager_message,
+        reload_prompt=reload_prompt,
+        prompt_dir=_AGENT_CONFIG_DIR,
+        sender_id=sender_id,
+        text=text,
+        name=name,
+        is_manager_fn=_is_manager,
+        is_paused_fn=_is_paused,
+        set_paused_memory_fn=_set_paused_memory,
+        detect_manager_command_fn=_detect_manager_command,
+        log=log,
+        fallback_reply=_FALLBACK_REPLY,
+        prospect_test_id=_PROSPECT_TEST_ID,
+    )
 
 
 
 async def _wa_handle_unsupported(sender_id: str):
-    """Reply to non-text messages (voice, image, sticker, etc.)."""
-    text = "Hai! Saya Maya 😊 Saya hanya boleh baca teks buat masa ni. Boleh taip soalan awak?"
-    await _store_outbound_message(sender_id, "whatsapp", text)
-    await _wa_send_text(
-        sender_id,
-        text
+    await whatsapp_handle_unsupported(
+        store_outbound_message_fn=_store_outbound_message,
+        send_text=_wa_send_text,
+        sender_id=sender_id,
     )
 
 
@@ -725,31 +479,15 @@ _SEND_BACKOFF_BASE = 2.0  # seconds
 
 
 async def _wa_send_text(to: str, text: str):
-    """Send a text message via the local WA Gateway (whatsapp-web.js)."""
-    if not text or not text.strip():
-        log.error("wa_send_text_empty_guard_triggered", to=to)
-        raise ValueError(f"_wa_send_text: empty text for to={to}")
-    chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
-    async with httpx.AsyncClient(timeout=15) as client:
-        for chunk in chunks:
-            for attempt in range(_SEND_RETRIES):
-                try:
-                    resp = await client.post(
-                        f"{settings.wa_gateway_base_url.rstrip('/')}/send",
-                        json={"number": to, "text": chunk},
-                    )
-                    if resp.status_code == 200:
-                        break
-                    raise RuntimeError(f"status={resp.status_code} body={resp.text[:200]}")
-                except Exception as exc:
-                    if attempt == _SEND_RETRIES - 1:
-                        log.error("wa_send_failed", to=to, attempt=attempt + 1, error=str(exc))
-                        raise
-                    wait = _SEND_BACKOFF_BASE ** attempt
-                    log.warning("wa_send_retry", to=to, attempt=attempt + 1,
-                                wait=wait, error=str(exc))
-                    await asyncio.sleep(wait)
-    log.info("wa_send_ok", to=to, reply_len=len(text), chunks=len(chunks))
+    await whatsapp_send_text(
+        http_client_factory=httpx.AsyncClient,
+        settings=settings,
+        log=log,
+        to=to,
+        text=text,
+        retries=_SEND_RETRIES,
+        backoff_base=_SEND_BACKOFF_BASE,
+    )
 
 
 # ------------------------------------------------------------------ #
