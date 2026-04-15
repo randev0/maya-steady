@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     # Facebook Messenger
     fb_page_access_token: Optional[str] = None
     fb_verify_token: str = "leadqualbot_verify_2024"
+    fb_app_secret: Optional[str] = None
 
     # WhatsApp Cloud API (Meta)
     wa_phone_number_id: Optional[str] = None      # From Meta App Dashboard
@@ -53,6 +54,11 @@ class Settings(BaseSettings):
     app_host: str = "0.0.0.0"
     app_port: int = 8080
     debug: bool = False
+    admin_api_token: Optional[str] = None
+    telegram_bot_token: Optional[str] = None
+    telegram_chat_id: Optional[str] = None
+    wa_gateway_base_url: str = "http://127.0.0.1:3001"
+    followup_dispatch_interval_seconds: int = 60
 
     # Webhook export (optional: push qualified leads to external system)
     lead_export_webhook_url: Optional[str] = None

@@ -5,7 +5,14 @@ import pytest
 from fastapi import HTTPException
 
 from database.dal import Database
-from main import PauseRequest, _build_pause_action_token, set_pause_by_conv
+from main import (
+    PauseRequest,
+    _build_pause_action_token,
+    _extract_admin_token,
+    _is_valid_fb_signature,
+    _require_admin_access,
+    set_pause_by_conv,
+)
 from whatsapp_identity import normalize_external_id, normalize_whatsapp_id
 
 
@@ -86,3 +93,36 @@ async def test_set_pause_accepts_valid_signed_token():
 
     assert result == {"ok": True, "paused": True}
     mock_db.set_user_paused.assert_awaited_once_with(user_id, True)
+
+
+def test_extract_admin_token_supports_bearer_and_header():
+    assert _extract_admin_token("Bearer topsecret", None) == "topsecret"
+    assert _extract_admin_token(None, "header-secret") == "header-secret"
+    assert _extract_admin_token("Basic nope", None) is None
+
+
+def test_require_admin_access_accepts_matching_token():
+    with patch("main.settings.admin_api_token", "topsecret"):
+        _require_admin_access(authorization="Bearer topsecret", x_admin_token=None)
+
+
+def test_require_admin_access_rejects_bad_token():
+    with patch("main.settings.admin_api_token", "topsecret"):
+        with pytest.raises(HTTPException) as exc:
+            _require_admin_access(authorization="Bearer wrong", x_admin_token=None)
+    assert exc.value.status_code == 401
+
+
+def test_is_valid_fb_signature_checks_sha256():
+    body = b'{"object":"page"}'
+    secret = "fb-secret"
+    token = _build_pause_action_token(uuid4(), True)
+    assert token  # guard import of hashlib/hmac path stays live
+
+    import hashlib
+    import hmac
+
+    signature = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+    with patch("main.settings.fb_app_secret", secret):
+        assert _is_valid_fb_signature(body, signature) is True
+        assert _is_valid_fb_signature(body, "sha256=bad") is False

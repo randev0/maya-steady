@@ -8,5 +8,7 @@ __pycache__/
 
 wa_gateway/node_modules/
 wa_gateway/.wwebjs_cache/
+wa_gateway/auth/
+wa_gateway/.wwebjs_auth/
 
 .DS_Store

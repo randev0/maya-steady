@@ -68,7 +68,9 @@ async def test_dispatch_due_followups_persists_message_before_send():
         "follow_up_type": "30min",
         "message_id": None,
     }
-    with patch("main.Database") as mock_db, patch(
+    with patch("main._acquire_followup_dispatch_lock", AsyncMock(return_value=object())), patch(
+        "main._release_followup_dispatch_lock", AsyncMock()
+    ), patch("main.Database") as mock_db, patch(
         "main._store_outbound_message", AsyncMock(return_value={"id": "msg1"})
     ) as mock_store, patch("main._wa_send_text", AsyncMock()) as mock_send:
         mock_db.get_due_followups = AsyncMock(return_value=[followup])
@@ -101,7 +103,9 @@ async def test_dispatch_due_followups_does_not_duplicate_stored_message():
         "follow_up_type": "30min",
         "message_id": "msg1",
     }
-    with patch("main.Database") as mock_db, patch(
+    with patch("main._acquire_followup_dispatch_lock", AsyncMock(return_value=object())), patch(
+        "main._release_followup_dispatch_lock", AsyncMock()
+    ), patch("main.Database") as mock_db, patch(
         "main._store_outbound_message", AsyncMock()
     ) as mock_store, patch("main._wa_send_text", AsyncMock()) as mock_send:
         mock_db.get_due_followups = AsyncMock(return_value=[followup])
@@ -112,6 +116,16 @@ async def test_dispatch_due_followups_does_not_duplicate_stored_message():
 
     mock_store.assert_not_awaited()
     mock_send.assert_awaited_once_with("6012", "Checking in")
+
+
+@pytest.mark.asyncio
+async def test_dispatch_due_followups_skips_when_lock_unavailable():
+    with patch("main._acquire_followup_dispatch_lock", AsyncMock(return_value=None)), patch(
+        "main.Database"
+    ) as mock_db:
+        await _dispatch_due_followups_once()
+
+    mock_db.get_due_followups.assert_not_called()
 
 
 @pytest.mark.asyncio

@@ -6,11 +6,11 @@ Handles:
   - Admin dashboard (Jinja2 templates)
   - Dashboard API routes
 """
-import os
 import json
 import asyncio
 import hashlib
 import hmac
+from contextlib import asynccontextmanager, suppress
 import structlog
 import httpx
 from datetime import datetime, timezone
@@ -18,7 +18,7 @@ from pathlib import Path
 from uuid import UUID
 from typing import Optional
 
-from fastapi import FastAPI, Request, HTTPException, Query
+from fastapi import FastAPI, Request, HTTPException, Query, Depends, Header
 from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -32,44 +32,12 @@ from agent_config.seed_skills import SEED_SKILLS
 from whatsapp_identity import normalize_whatsapp_id
 
 _AGENT_CONFIG_DIR = Path(__file__).parent / "agent_config"
+_FOLLOWUP_DISPATCH_LOCK_KEY = 18420815
 
 log = structlog.get_logger()
 
-app = FastAPI(title="LeadQualBot", version="1.0.0")
-
-# ------------------------------------------------------------------ #
-# Telegram Alerts
-# ------------------------------------------------------------------ #
-
-_TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-_TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "")
-
-
-async def _tg_alert(text: str) -> None:
-    """Fire-and-forget Telegram message to the owner."""
-    if not _TG_TOKEN or not _TG_CHAT:
-        return
-    try:
-        async with httpx.AsyncClient(timeout=8) as client:
-            await client.post(
-                f"https://api.telegram.org/bot{_TG_TOKEN}/sendMessage",
-                json={"chat_id": _TG_CHAT, "text": text, "parse_mode": "HTML"},
-            )
-    except Exception as exc:
-        log.warning("tg_alert_failed", error=str(exc))
-
-# Static files & templates
-_BASE = Path(__file__).parent
-app.mount("/static", StaticFiles(directory=str(_BASE / "dashboard" / "static")), name="static")
-templates = Jinja2Templates(directory=str(_BASE / "dashboard" / "templates"))
-
-
-# ------------------------------------------------------------------ #
-# Startup / Shutdown
-# ------------------------------------------------------------------ #
-
-@app.on_event("startup")
-async def startup():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     db_url = settings.database_url
     await Database.connect(db_url)
     schema_path = str(_BASE / "database" / "schema.sql")
@@ -82,25 +50,83 @@ async def startup():
         log.info("skills_seeded")
     except Exception as exc:
         log.info("skills_seed_skipped", reason=str(exc)[:120])
-    asyncio.create_task(_followup_dispatcher())
-    # Load currently paused users into memory
+
     paused_eids = await Database.load_paused_external_ids()
+    _wa_paused_set.clear()
     for eid in paused_eids:
         normalized = normalize_whatsapp_id(eid)
         if normalized:
             _wa_paused_set.add(normalized)
+
+    followup_task = asyncio.create_task(_followup_dispatcher(), name="followup-dispatcher")
+    app.state.followup_task = followup_task
     log.info("leadqualbot_started", model=agent.model, paused_users=len(paused_eids))
+    try:
+        yield
+    finally:
+        followup_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await followup_task
+        await Database.disconnect()
+
+
+app = FastAPI(title="LeadQualBot", version="1.0.0", lifespan=lifespan)
+
+
+async def _tg_alert(text: str) -> None:
+    """Fire-and-forget Telegram message to the owner."""
+    if not settings.telegram_bot_token or not settings.telegram_chat_id:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            await client.post(
+                f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage",
+                json={"chat_id": settings.telegram_chat_id, "text": text, "parse_mode": "HTML"},
+            )
+    except Exception as exc:
+        log.warning("tg_alert_failed", error=str(exc))
+
+# Static files & templates
+_BASE = Path(__file__).parent
+app.mount("/static", StaticFiles(directory=str(_BASE / "dashboard" / "static")), name="static")
+templates = Jinja2Templates(directory=str(_BASE / "dashboard" / "templates"))
 
 
 async def _followup_dispatcher():
-    """Background task: every 60s, send any due follow-up messages."""
+    """Background task: periodically send any due follow-up messages."""
     while True:
-        await asyncio.sleep(60)
+        await asyncio.sleep(settings.followup_dispatch_interval_seconds)
         await _dispatch_due_followups_once()
+
+
+async def _acquire_followup_dispatch_lock():
+    if not Database.pool:
+        return None
+    conn = await Database.pool.acquire()
+    try:
+        acquired = await conn.fetchval("SELECT pg_try_advisory_lock($1)", _FOLLOWUP_DISPATCH_LOCK_KEY)
+        if not acquired:
+            await Database.pool.release(conn)
+            return None
+        return conn
+    except Exception:
+        await Database.pool.release(conn)
+        raise
+
+
+async def _release_followup_dispatch_lock(conn) -> None:
+    try:
+        await conn.execute("SELECT pg_advisory_unlock($1)", _FOLLOWUP_DISPATCH_LOCK_KEY)
+    finally:
+        await Database.pool.release(conn)
 
 
 async def _dispatch_due_followups_once() -> None:
     """Send all due follow-ups once. Split out for testing and auditability."""
+    lock_conn = await _acquire_followup_dispatch_lock()
+    if lock_conn is None:
+        log.debug("followup_dispatcher_lock_skipped")
+        return
     try:
         due = await Database.get_due_followups()
         for fu in due:
@@ -141,11 +167,8 @@ async def _dispatch_due_followups_once() -> None:
                 log.error("followup_send_failed", id=str(fu["id"]), error=str(exc))
     except Exception as exc:
         log.error("followup_dispatcher_error", error=str(exc))
-
-
-@app.on_event("shutdown")
-async def shutdown():
-    await Database.disconnect()
+    finally:
+        await _release_followup_dispatch_lock(lock_conn)
 
 
 # ------------------------------------------------------------------ #
@@ -165,10 +188,31 @@ async def fb_verify(request: Request):
     raise HTTPException(status_code=403, detail="Verification failed")
 
 
+def _is_valid_fb_signature(body: bytes, signature: Optional[str]) -> bool:
+    if not settings.fb_app_secret or not signature:
+        return False
+    try:
+        scheme, expected = signature.split("=", 1)
+    except ValueError:
+        return False
+    if scheme != "sha256":
+        return False
+    digest = hmac.new(
+        settings.fb_app_secret.encode(),
+        body,
+        hashlib.sha256,
+    ).hexdigest()
+    return hmac.compare_digest(digest, expected)
+
+
 @app.post("/webhook/messenger")
 async def fb_webhook(request: Request):
     """Receive and process Facebook Messenger events."""
-    body = await request.json()
+    raw_body = await request.body()
+    signature = request.headers.get("X-Hub-Signature-256")
+    if not _is_valid_fb_signature(raw_body, signature):
+        raise HTTPException(status_code=403, detail="Invalid Facebook signature")
+    body = json.loads(raw_body)
 
     if body.get("object") != "page":
         return JSONResponse({"status": "ignored"})
@@ -225,12 +269,8 @@ async def _send_fb_reply(recipient_id: str, text: str):
 
 
 # ------------------------------------------------------------------ #
-# WhatsApp Webhook (Evolution API)
+# WhatsApp Webhook (local gateway)
 # ------------------------------------------------------------------ #
-
-EVOLUTION_API_URL = "http://127.0.0.1:8083"
-EVOLUTION_API_KEY = "maya_evo_2024"
-EVOLUTION_INSTANCE = "maya"
 
 # Debounce state: sender_id -> (pending_task, accumulated_texts, display_name)
 _wa_debounce: dict[str, asyncio.Task] = {}
@@ -267,6 +307,32 @@ def _set_paused_memory(external_id: str, paused: bool) -> None:
 
 def _pause_action_secret() -> str:
     return settings.pause_action_secret or settings.wa_verify_token
+
+
+def _extract_admin_token(
+    authorization: Optional[str],
+    x_admin_token: Optional[str],
+) -> Optional[str]:
+    if x_admin_token:
+        return x_admin_token.strip() or None
+    if not authorization:
+        return None
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer":
+        return None
+    return token.strip() or None
+
+
+def _require_admin_access(
+    authorization: Optional[str] = Header(default=None),
+    x_admin_token: Optional[str] = Header(default=None),
+) -> None:
+    expected = settings.admin_api_token
+    if not expected:
+        raise HTTPException(status_code=503, detail="Admin API token is not configured")
+    provided = _extract_admin_token(authorization, x_admin_token)
+    if not provided or not hmac.compare_digest(provided, expected):
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
 
 def _build_pause_action_token(conv_id: UUID, paused: bool) -> str:
@@ -404,7 +470,7 @@ class AdminReplyMessage(BaseModel):
 
 
 @app.post("/internal/wa/admin-reply")
-async def wa_admin_reply(msg: AdminReplyMessage):
+async def wa_admin_reply(msg: AdminReplyMessage, _: None = Depends(_require_admin_access)):
     """Called by the WA gateway when the admin manually replies to a customer."""
     asyncio.create_task(_handle_admin_reply(msg.recipient_id, msg.text))
     return {"status": "ok"}
@@ -428,7 +494,7 @@ class PauseRequest(BaseModel):
 
 
 @app.post("/api/wa/pause/{conv_id}")
-async def set_pause_by_conv(conv_id: UUID, body: PauseRequest):
+async def set_pause_by_conv(conv_id: UUID, body: PauseRequest, _: None = Depends(_require_admin_access)):
     """Dashboard toggle — called by conversation detail page JS."""
     if not _verify_pause_action_token(conv_id, body.paused, body.token):
         raise HTTPException(status_code=403, detail="Invalid pause token")
@@ -762,7 +828,7 @@ async def _wa_send_text(to: str, text: str):
             for attempt in range(_SEND_RETRIES):
                 try:
                     resp = await client.post(
-                        "http://127.0.0.1:3001/send",
+                        f"{settings.wa_gateway_base_url.rstrip('/')}/send",
                         json={"number": to, "text": chunk},
                     )
                     if resp.status_code == 200:
@@ -807,7 +873,7 @@ class WAInternalMessage(BaseModel):
 
 
 @app.post("/internal/wa")
-async def wa_internal(msg: WAInternalMessage):
+async def wa_internal(msg: WAInternalMessage, _: None = Depends(_require_admin_access)):
     """Receive inbound WhatsApp messages from the local WA Gateway."""
     _wa_enqueue(msg.sender_id, msg.text, msg.name)
     return {"status": "ok"}
@@ -931,7 +997,7 @@ async def dashboard_handoffs(
 # ------------------------------------------------------------------ #
 
 @app.patch("/api/handoffs/{handoff_id}")
-async def update_handoff(handoff_id: UUID, body: dict):
+async def update_handoff(handoff_id: UUID, body: dict, _: None = Depends(_require_admin_access)):
     status = body.get("status")
     if status not in ("in_progress", "resolved"):
         raise HTTPException(status_code=400, detail="Invalid status")
@@ -941,7 +1007,7 @@ async def update_handoff(handoff_id: UUID, body: dict):
 
 
 @app.patch("/api/leads/{user_id}/facts")
-async def update_lead_facts(user_id: UUID, body: dict):
+async def update_lead_facts(user_id: UUID, body: dict, _: None = Depends(_require_admin_access)):
     """Admin endpoint to directly edit a lead's structured facts."""
     facts = body.get("facts", {})
     if not facts:
@@ -951,7 +1017,7 @@ async def update_lead_facts(user_id: UUID, body: dict):
 
 
 @app.delete("/api/conversations/{conv_id}")
-async def delete_conversation(conv_id: UUID):
+async def delete_conversation(conv_id: UUID, _: None = Depends(_require_admin_access)):
     """Delete a conversation and all its messages."""
     await Database.delete_conversation(conv_id)
     return {"ok": True}
@@ -981,7 +1047,7 @@ async def wa_qr():
     """Proxy to the WA Gateway QR code page."""
     async with httpx.AsyncClient(timeout=5) as client:
         try:
-            resp = await client.get("http://127.0.0.1:3001/qr")
+            resp = await client.get(f"{settings.wa_gateway_base_url.rstrip('/')}/qr")
             return HTMLResponse(content=resp.text, status_code=resp.status_code)
         except Exception:
             return HTMLResponse(content="<h2>WA Gateway not running</h2>", status_code=503)

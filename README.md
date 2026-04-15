@@ -61,13 +61,17 @@ Important settings:
 - `OPENROUTER_API_KEY`
 - `FB_PAGE_ACCESS_TOKEN`
 - `FB_VERIFY_TOKEN`
+- `FB_APP_SECRET`
 - `WA_PHONE_NUMBER_ID`
 - `WA_ACCESS_TOKEN`
 - `WA_VERIFY_TOKEN`
+- `WA_GATEWAY_BASE_URL`
 - `MANAGER_WA_ID`
 - `DASHBOARD_URL`
+- `ADMIN_API_TOKEN`
 
 Note: the app also contains a local WhatsApp gateway integration in `wa_gateway/`. Review the gateway-specific service and package files before deploying that path.
+Set the same `ADMIN_API_TOKEN` in the API and the gateway environment so internal control routes stay authenticated.
 
 ## Local Run
 

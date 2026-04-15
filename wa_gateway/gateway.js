@@ -2,7 +2,7 @@
  * WhatsApp Gateway — bridges WhatsApp Web to the LeadQualBot FastAPI agent.
  * Listens on port 3001.
  *   POST /send  { number: "601234567890", text: "..." }  → send WA message
- * Incoming WA messages → POST http://127.0.0.1:8080/internal/wa
+ * Incoming WA messages → POST ${FASTAPI_BASE_URL}/internal/wa
  */
 
 const { Client, LocalAuth } = require('whatsapp-web.js');
@@ -12,8 +12,16 @@ const qrcode = require('qrcode');
 const app = express();
 app.use(express.json());
 
-const FASTAPI_URL = 'http://127.0.0.1:8080/internal/wa';
+const FASTAPI_BASE_URL = process.env.FASTAPI_BASE_URL || 'http://127.0.0.1:8080';
+const FASTAPI_URL = `${FASTAPI_BASE_URL}/internal/wa`;
+const ADMIN_API_TOKEN = process.env.ADMIN_API_TOKEN || '';
 const PORT = 3001;
+
+function internalHeaders() {
+    const headers = { 'Content-Type': 'application/json' };
+    if (ADMIN_API_TOKEN) headers['X-Admin-Token'] = ADMIN_API_TOKEN;
+    return headers;
+}
 
 let clientReady = false;
 let currentQR = null;
@@ -84,7 +92,7 @@ client.on('message', async (message) => {
     try {
         const res = await fetch(FASTAPI_URL, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: internalHeaders(),
             body: JSON.stringify({ sender_id, text, name }),
         });
         if (!res.ok) {
@@ -112,9 +120,9 @@ client.on('message_create', async (message) => {
 
     console.log(`[WA Gateway] Admin reply detected → ${to}: ${(message.body || '').substring(0, 60)}`);
     try {
-        await fetch('http://127.0.0.1:8080/internal/wa/admin-reply', {
+        await fetch(`${FASTAPI_BASE_URL}/internal/wa/admin-reply`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: internalHeaders(),
             body: JSON.stringify({ recipient_id: to, text: message.body || '' }),
         });
     } catch (e) {
