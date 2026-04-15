@@ -15,8 +15,8 @@ from pathlib import Path
 from uuid import UUID
 from typing import Optional
 
-from fastapi import FastAPI, Request, HTTPException, Query, Depends
-from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse
+from fastapi import FastAPI, Request, HTTPException, Depends
+from fastapi.responses import PlainTextResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
@@ -33,6 +33,7 @@ from app_support.followups import (
     followup_dispatcher_loop,
     release_followup_dispatch_lock,
 )
+from app_support.dashboard import build_dashboard_router
 from app_support.whatsapp import (
     WhatsAppRuntimeState,
     check_trial_gate as whatsapp_check_trial_gate,
@@ -250,6 +251,16 @@ _extract_admin_token = extract_admin_token
 _require_admin_access = require_admin_access
 _build_pause_action_token = build_pause_action_token
 _verify_pause_action_token = verify_pause_action_token
+
+app.include_router(
+    build_dashboard_router(
+        templates=templates,
+        db=Database,
+        require_admin_access=_require_admin_access,
+        build_pause_action_token=_build_pause_action_token,
+        settings=settings,
+    )
+)
 
 
 def _wa_enqueue(sender_id: str, text: str, name: Optional[str]) -> None:
@@ -534,165 +545,3 @@ async def chat_history(external_id: str):
         return {"messages": []}
     history = await Database.get_conversation_history(conv["id"], limit=100)
     return {"messages": history}
-
-
-# ------------------------------------------------------------------ #
-# Dashboard Routes
-
-
-@app.get("/dashboard/analytics", response_class=HTMLResponse)
-async def dashboard_analytics(request: Request):
-    analytics_data = await Database.get_analytics()  # Fetch analytics data
-    return templates.TemplateResponse(
-        "analytics.html",
-        {"request": request, "analytics": analytics_data, "page": "analytics"},
-    )
-
-# ------------------------------------------------------------------ #
-
-@app.get("/", response_class=HTMLResponse)
-async def dashboard_home(request: Request):
-    analytics = await Database.get_analytics()
-    return templates.TemplateResponse(
-        "index.html",
-        {"request": request, "analytics": analytics, "page": "overview"},
-    )
-
-
-@app.get("/conversations", response_class=HTMLResponse)
-async def dashboard_conversations(
-    request: Request,
-    page: int = Query(1, ge=1),
-):
-    limit = 20
-    offset = (page - 1) * limit
-    conversations = await Database.list_conversations(limit=limit, offset=offset)
-    return templates.TemplateResponse(
-        "conversations.html",
-        {
-            "request": request,
-            "conversations": conversations,
-            "page": page,
-            "has_next": len(conversations) == limit,
-            "active_page": "conversations",
-        },
-    )
-
-
-@app.get("/conversations/{conv_id}", response_class=HTMLResponse)
-async def conversation_detail(request: Request, conv_id: UUID):
-    detail = await Database.get_conversation_detail(conv_id)
-    if not detail:
-        raise HTTPException(status_code=404, detail="Conversation not found")
-    audit = await Database.get_facts_audit(detail["user_id"])
-    pause = await Database.get_pause_state(detail["user_id"])
-    return templates.TemplateResponse(
-        "conversation_detail.html",
-        {
-            "request": request,
-            "conv": detail,
-            "audit": audit,
-            "maya_paused": pause["paused"],
-            "pause_token": _build_pause_action_token(conv_id, True),
-            "resume_token": _build_pause_action_token(conv_id, False),
-            "active_page": "conversations",
-        },
-    )
-
-
-@app.get("/leads", response_class=HTMLResponse)
-async def dashboard_leads(
-    request: Request,
-    page: int = Query(1, ge=1),
-):
-    limit = 20
-    offset = (page - 1) * limit
-    leads = await Database.list_leads(limit=limit, offset=offset)
-    return templates.TemplateResponse(
-        "leads.html",
-        {
-            "request": request,
-            "leads": leads,
-            "page": page,
-            "has_next": len(leads) == limit,
-            "active_page": "leads",
-        },
-    )
-
-
-@app.get("/handoffs", response_class=HTMLResponse)
-async def dashboard_handoffs(
-    request: Request,
-    status: str = Query("pending"),
-):
-    handoffs = await Database.list_handoffs(status=status)
-    return templates.TemplateResponse(
-        "handoffs.html",
-        {
-            "request": request,
-            "handoffs": handoffs,
-            "filter_status": status,
-            "active_page": "handoffs",
-        },
-    )
-
-
-# ------------------------------------------------------------------ #
-# Dashboard API Actions
-# ------------------------------------------------------------------ #
-
-@app.patch("/api/handoffs/{handoff_id}")
-async def update_handoff(handoff_id: UUID, body: dict, _: None = Depends(_require_admin_access)):
-    status = body.get("status")
-    if status not in ("in_progress", "resolved"):
-        raise HTTPException(status_code=400, detail="Invalid status")
-    assigned_to = body.get("assigned_to")
-    await Database.update_handoff_status(handoff_id, status, assigned_to)
-    return {"ok": True}
-
-
-@app.patch("/api/leads/{user_id}/facts")
-async def update_lead_facts(user_id: UUID, body: dict, _: None = Depends(_require_admin_access)):
-    """Admin endpoint to directly edit a lead's structured facts."""
-    facts = body.get("facts", {})
-    if not facts:
-        raise HTTPException(status_code=400, detail="No facts provided")
-    updated = await Database.update_facts(user_id, facts, changed_by="admin")
-    return {"ok": True, "facts": updated.get("facts", {})}
-
-
-@app.delete("/api/conversations/{conv_id}")
-async def delete_conversation(conv_id: UUID, _: None = Depends(_require_admin_access)):
-    """Delete a conversation and all its messages."""
-    await Database.delete_conversation(conv_id)
-    return {"ok": True}
-
-
-@app.get("/api/analytics")
-async def api_analytics():
-    return await Database.get_analytics()
-
-
-@app.get("/api/learning")
-async def api_learning():
-    return await Database.get_learning_stats()
-
-
-@app.get("/learning", response_class=HTMLResponse)
-async def dashboard_learning(request: Request):
-    stats = await Database.get_learning_stats()
-    return templates.TemplateResponse(
-        "learning.html",
-        {"request": request, "stats": stats, "active_page": "learning"},
-    )
-
-
-@app.get("/wa-qr", response_class=HTMLResponse)
-async def wa_qr():
-    """Proxy to the WA Gateway QR code page."""
-    async with httpx.AsyncClient(timeout=5) as client:
-        try:
-            resp = await client.get(f"{settings.wa_gateway_base_url.rstrip('/')}/qr")
-            return HTMLResponse(content=resp.text, status_code=resp.status_code)
-        except Exception:
-            return HTMLResponse(content="<h2>WA Gateway not running</h2>", status_code=503)
