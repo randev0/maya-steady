@@ -8,8 +8,6 @@ Handles:
 """
 import json
 import asyncio
-import hashlib
-import hmac
 from contextlib import asynccontextmanager, suppress
 import structlog
 import httpx
@@ -18,7 +16,7 @@ from pathlib import Path
 from uuid import UUID
 from typing import Optional
 
-from fastapi import FastAPI, Request, HTTPException, Query, Depends, Header
+from fastapi import FastAPI, Request, HTTPException, Query, Depends
 from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -30,9 +28,21 @@ from agent import agent, AgentError, reload_prompt, _FALLBACK_REPLY
 from manager_agent import process_manager_message
 from agent_config.seed_skills import SEED_SKILLS
 from whatsapp_identity import normalize_whatsapp_id
+from app_support.followups import (
+    acquire_followup_dispatch_lock,
+    dispatch_due_followups_once,
+    followup_dispatcher_loop,
+    release_followup_dispatch_lock,
+)
+from app_support.security import (
+    build_pause_action_token,
+    extract_admin_token,
+    is_valid_fb_signature,
+    require_admin_access,
+    verify_pause_action_token,
+)
 
 _AGENT_CONFIG_DIR = Path(__file__).parent / "agent_config"
-_FOLLOWUP_DISPATCH_LOCK_KEY = 18420815
 
 log = structlog.get_logger()
 
@@ -94,81 +104,27 @@ templates = Jinja2Templates(directory=str(_BASE / "dashboard" / "templates"))
 
 async def _followup_dispatcher():
     """Background task: periodically send any due follow-up messages."""
-    while True:
-        await asyncio.sleep(settings.followup_dispatch_interval_seconds)
-        await _dispatch_due_followups_once()
+    await followup_dispatcher_loop(_dispatch_due_followups_once)
 
 
 async def _acquire_followup_dispatch_lock():
-    if not Database.pool:
-        return None
-    conn = await Database.pool.acquire()
-    try:
-        acquired = await conn.fetchval("SELECT pg_try_advisory_lock($1)", _FOLLOWUP_DISPATCH_LOCK_KEY)
-        if not acquired:
-            await Database.pool.release(conn)
-            return None
-        return conn
-    except Exception:
-        await Database.pool.release(conn)
-        raise
+    return await acquire_followup_dispatch_lock()
 
 
 async def _release_followup_dispatch_lock(conn) -> None:
-    try:
-        await conn.execute("SELECT pg_advisory_unlock($1)", _FOLLOWUP_DISPATCH_LOCK_KEY)
-    finally:
-        await Database.pool.release(conn)
+    await release_followup_dispatch_lock(conn)
 
 
 async def _dispatch_due_followups_once() -> None:
     """Send all due follow-ups once. Split out for testing and auditability."""
-    lock_conn = await _acquire_followup_dispatch_lock()
-    if lock_conn is None:
-        log.debug("followup_dispatcher_lock_skipped")
-        return
-    try:
-        due = await Database.get_due_followups()
-        for fu in due:
-            try:
-                if not fu.get("message_id"):
-                    stored = await _store_outbound_message(
-                        external_id=fu["external_id"],
-                        channel=fu["channel"],
-                        text=fu["message"],
-                        conversation_id=fu.get("conversation_id"),
-                        source="follow_up",
-                    )
-                    await Database.attach_followup_message(fu["id"], stored["id"])
-                channel = fu["channel"]
-                if channel == "whatsapp":
-                    await _wa_send_text(fu["external_id"], fu["message"])
-                elif channel == "facebook":
-                    await _send_fb_reply(fu["external_id"], fu["message"])
-                await Database.mark_followup_sent(fu["id"])
-                await Database.record_tool_outcome(
-                    tool_name="follow_up_dispatcher",
-                    success=True,
-                    reason=fu["follow_up_type"],
-                    details={"follow_up_id": str(fu["id"]), "channel": channel},
-                    user_id=fu["user_id"],
-                    conversation_id=fu.get("conversation_id"),
-                )
-                log.info("followup_sent", type=fu["follow_up_type"], user=fu["external_id"])
-            except Exception as exc:
-                await Database.record_tool_outcome(
-                    tool_name="follow_up_dispatcher",
-                    success=False,
-                    reason=str(exc),
-                    details={"follow_up_id": str(fu["id"]), "channel": fu["channel"]},
-                    user_id=fu["user_id"],
-                    conversation_id=fu.get("conversation_id"),
-                )
-                log.error("followup_send_failed", id=str(fu["id"]), error=str(exc))
-    except Exception as exc:
-        log.error("followup_dispatcher_error", error=str(exc))
-    finally:
-        await _release_followup_dispatch_lock(lock_conn)
+    await dispatch_due_followups_once(
+        db=Database,
+        acquire_lock=_acquire_followup_dispatch_lock,
+        release_lock=_release_followup_dispatch_lock,
+        store_outbound_message=_store_outbound_message,
+        send_whatsapp=_wa_send_text,
+        send_facebook=_send_fb_reply,
+    )
 
 
 # ------------------------------------------------------------------ #
@@ -188,21 +144,7 @@ async def fb_verify(request: Request):
     raise HTTPException(status_code=403, detail="Verification failed")
 
 
-def _is_valid_fb_signature(body: bytes, signature: Optional[str]) -> bool:
-    if not settings.fb_app_secret or not signature:
-        return False
-    try:
-        scheme, expected = signature.split("=", 1)
-    except ValueError:
-        return False
-    if scheme != "sha256":
-        return False
-    digest = hmac.new(
-        settings.fb_app_secret.encode(),
-        body,
-        hashlib.sha256,
-    ).hexdigest()
-    return hmac.compare_digest(digest, expected)
+_is_valid_fb_signature = is_valid_fb_signature
 
 
 @app.post("/webhook/messenger")
@@ -305,45 +247,10 @@ def _set_paused_memory(external_id: str, paused: bool) -> None:
         _wa_paused_set.discard(bare)
 
 
-def _pause_action_secret() -> str:
-    return settings.pause_action_secret or settings.wa_verify_token
-
-
-def _extract_admin_token(
-    authorization: Optional[str],
-    x_admin_token: Optional[str],
-) -> Optional[str]:
-    if x_admin_token:
-        return x_admin_token.strip() or None
-    if not authorization:
-        return None
-    scheme, _, token = authorization.partition(" ")
-    if scheme.lower() != "bearer":
-        return None
-    return token.strip() or None
-
-
-def _require_admin_access(
-    authorization: Optional[str] = Header(default=None),
-    x_admin_token: Optional[str] = Header(default=None),
-) -> None:
-    expected = settings.admin_api_token
-    if not expected:
-        raise HTTPException(status_code=503, detail="Admin API token is not configured")
-    provided = _extract_admin_token(authorization, x_admin_token)
-    if not provided or not hmac.compare_digest(provided, expected):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-
-def _build_pause_action_token(conv_id: UUID, paused: bool) -> str:
-    payload = f"{conv_id}:{int(paused)}".encode()
-    return hmac.new(_pause_action_secret().encode(), payload, hashlib.sha256).hexdigest()
-
-
-def _verify_pause_action_token(conv_id: UUID, paused: bool, token: str) -> bool:
-    if not token:
-        return False
-    return hmac.compare_digest(token, _build_pause_action_token(conv_id, paused))
+_extract_admin_token = extract_admin_token
+_require_admin_access = require_admin_access
+_build_pause_action_token = build_pause_action_token
+_verify_pause_action_token = verify_pause_action_token
 
 
 def _wa_enqueue(sender_id: str, text: str, name: Optional[str]) -> None:
