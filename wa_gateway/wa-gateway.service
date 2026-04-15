@@ -1,11 +1,11 @@
 [Unit]
-Description=WhatsApp Gateway — whatsapp-web.js bridge for LeadQualBot
+Description=WhatsApp Gateway — whatsapp-web.js bridge for Maya Steady
 After=network.target agent.service
 
 [Service]
 Type=simple
 User=selfops
-WorkingDirectory=/personalized_agent_bot/wa_gateway
+WorkingDirectory=/opt/maya-steady/wa_gateway
 ExecStart=/usr/bin/node gateway.js
 Restart=on-failure
 RestartSec=10

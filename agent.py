@@ -1,5 +1,5 @@
 """
-LeadQualBot Agent Runtime
+Maya Steady Agent Runtime
 Customer-facing model usage is bounded to extraction, summarization, and reply generation.
 Business logic remains code-owned.
 """

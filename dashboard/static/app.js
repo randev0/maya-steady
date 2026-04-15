@@ -1,4 +1,4 @@
-// LeadQualBot Admin — shared JS utilities
+// Maya Steady Admin — shared JS utilities
 
 // Auto-refresh analytics every 30s on the overview page
 if (window.location.pathname === '/') {

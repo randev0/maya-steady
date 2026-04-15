@@ -1,5 +1,5 @@
 """
-Data Access Layer — all database operations for LeadQualBot.
+Data Access Layer — all database operations for Maya Steady.
 Uses asyncpg for async PostgreSQL access.
 """
 import json

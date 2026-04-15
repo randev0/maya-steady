@@ -182,7 +182,7 @@ async def process_manager_message(message: str) -> str:
         base_url="https://openrouter.ai/api/v1",
         default_headers={
             "HTTP-Referer": "https://agent.steadigital.com",
-            "X-Title": "LeadQualBot-Manager",
+            "X-Title": "MayaSteady-Manager",
         },
     )
 

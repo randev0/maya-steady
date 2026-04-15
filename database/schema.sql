@@ -1,4 +1,4 @@
--- LeadQualBot Database Schema
+-- Maya Steady Database Schema
 -- Run this once to set up all tables
 
 -- Users: leads interacting with the agent

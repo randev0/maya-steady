@@ -1,5 +1,5 @@
 """
-LeadQualBot — FastAPI Application
+Maya Steady — FastAPI Application
 Handles:
   - Facebook Messenger webhook
   - Test/simulator chat endpoint
@@ -60,7 +60,7 @@ async def lifespan(app: FastAPI):
 
     followup_task = asyncio.create_task(_followup_dispatcher(), name="followup-dispatcher")
     app.state.followup_task = followup_task
-    log.info("leadqualbot_started", model=agent.model, paused_users=len(paused_eids))
+    log.info("maya_steady_started", model=agent.model, paused_users=len(paused_eids))
     try:
         yield
     finally:
@@ -70,7 +70,7 @@ async def lifespan(app: FastAPI):
         await Database.disconnect()
 
 
-app = FastAPI(title="LeadQualBot", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="Maya Steady", version="1.0.0", lifespan=lifespan)
 
 
 async def _tg_alert(text: str) -> None:

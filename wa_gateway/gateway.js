@@ -1,5 +1,5 @@
 /**
- * WhatsApp Gateway — bridges WhatsApp Web to the LeadQualBot FastAPI agent.
+ * WhatsApp Gateway — bridges WhatsApp Web to the Maya Steady FastAPI agent.
  * Listens on port 3001.
  *   POST /send  { number: "601234567890", text: "..." }  → send WA message
  * Incoming WA messages → POST ${FASTAPI_BASE_URL}/internal/wa

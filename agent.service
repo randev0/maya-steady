@@ -1,10 +1,10 @@
-# LeadQualBot systemd service
-# Install: sudo cp /personalized_agent_bot/agent.service /etc/systemd/system/
+# Maya Steady systemd service
+# Install: sudo cp agent.service /etc/systemd/system/
 #          sudo systemctl daemon-reload
 #          sudo systemctl enable --now agent
 
 [Unit]
-Description=LeadQualBot — AI Lead Qualification Agent
+Description=Maya Steady — policy-governed sales chatbot
 After=network.target postgresql@16-main.service
 Wants=postgresql@16-main.service
 
@@ -12,13 +12,13 @@ Wants=postgresql@16-main.service
 Type=simple
 User=selfops
 Group=selfops
-WorkingDirectory=/personalized_agent_bot
+WorkingDirectory=/opt/maya-steady
 
 # Load environment variables from .env file
-EnvironmentFile=/personalized_agent_bot/.env
+EnvironmentFile=/opt/maya-steady/.env
 
 # Use the virtualenv
-ExecStart=/personalized_agent_bot/.venv/bin/uvicorn main:app \
+ExecStart=/opt/maya-steady/.venv/bin/uvicorn main:app \
     --host 0.0.0.0 \
     --port 8080 \
     --workers 2 \
@@ -37,7 +37,7 @@ StartLimitBurst=3
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
-ReadWritePaths=/personalized_agent_bot
+ReadWritePaths=/opt/maya-steady
 
 # Logging — viewable via: journalctl -u agent -f
 StandardOutput=journal

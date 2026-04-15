@@ -1,4 +1,4 @@
-# LeadQualBot — Kubernetes routing manifests
+# Maya Steady — Kubernetes routing manifests
 # Routes agent.steadigital.com → host process on port 8080
 # Uses existing Traefik ingress controller + cert-manager (letsencrypt-prod)
 #
